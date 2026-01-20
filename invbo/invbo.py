@@ -6,7 +6,12 @@ import torch.nn.functional as F
 
 from gpytorch.mlls import PredictiveLogLikelihood 
 from invbo.utils.bo_utils.turbo import TurboState, update_state, generate_batch
-from invbo.utils.utils import update_models_end_to_end, update_surr_model
+from invbo.utils.utils import (
+    update_models_end_to_end,
+    update_surr_model,
+    ConditionalEncoder,
+    PseudoLabeler,
+)
 from invbo.utils.bo_utils.ppgpr import GPModelDKL
 from invbo.utils.mol_utils.selfies_vae.data import collate_fn
 
@@ -18,6 +23,7 @@ class InvBOState:
         train_x,
         train_y,
         train_z,
+        train_covariates=None,
         k=50,
         minimize=False,
         num_update_epochs=2,
@@ -30,12 +36,25 @@ class InvBOState:
         beta=1, # Surr loss
         gamma=1, # VAE loss
         delta=1,
+        conditional_input_dim=None,
+        conditional_hidden_dim=32,
+        conditional_loss_weight=0.0,
+        use_pseudo_labels=False,
+        pseudo_label_quantile=0.8,
+        pseudo_label_min_weight=0.2,
+        pseudo_label_uncertainty_weight=0.1,
+        conditional_trust_region=False,
+        conditional_similarity_weight=0.6,
+        conditional_potential_weight=0.4,
+        conditional_tr_scale=0.3,
+        conditional_potential_uncertainty=0.1,
         ):
 
         self.objective          = objective         # objective with vae for particular task
         self.train_x            = train_x           # initial train x data
         self.train_y            = train_y           # initial train y data
         self.train_z            = train_z           # initial train z data
+        self.train_covariates   = train_covariates  # optional covariates aligned to train_x
         self.minimize           = minimize          # if True we want to minimize the objective, otherwise we assume we want to maximize the objective
         self.k                  = k                 # track and update on top k scoring points found
         self.num_update_epochs  = num_update_epochs # num epochs update models
@@ -48,6 +67,18 @@ class InvBOState:
         self.beta               = beta
         self.gamma              = gamma
         self.delta              = delta
+        self.conditional_input_dim = conditional_input_dim
+        self.conditional_hidden_dim = conditional_hidden_dim
+        self.conditional_loss_weight = conditional_loss_weight
+        self.use_pseudo_labels = use_pseudo_labels
+        self.pseudo_label_quantile = pseudo_label_quantile
+        self.pseudo_label_min_weight = pseudo_label_min_weight
+        self.pseudo_label_uncertainty_weight = pseudo_label_uncertainty_weight
+        self.conditional_trust_region = conditional_trust_region
+        self.conditional_similarity_weight = conditional_similarity_weight
+        self.conditional_potential_weight = conditional_potential_weight
+        self.conditional_tr_scale = conditional_tr_scale
+        self.conditional_potential_uncertainty = conditional_potential_uncertainty
         
         assert acq_func in ["ts"]
         if minimize:
@@ -57,13 +88,18 @@ class InvBOState:
         self.tot_num_e2e_updates = 0
         self.best_score_seen = torch.max(train_y)
         self.best_x_seen = train_x[torch.argmax(train_y.squeeze())]
+        self.best_covariate = None
         self.initial_model_training_complete = False # initial training of surrogate model uses all data for more epochs
         self.new_best_found = False
+        self.conditional_encoder = self.initialize_conditional_encoder()
+        self.pseudo_labeler = self.initialize_pseudo_labeler()
+        self.xs_to_covariates = {}
 
         self.initialize_top_k()
         self.initialize_surrogate_model()
         self.initialize_tr_state()
         self.initialize_xs_to_scores_dict()
+        self.initialize_covariates()
 
     def initialize_xs_to_scores_dict(self,):
         init_xs_to_scores_dict = {}
@@ -78,6 +114,38 @@ class InvBOState:
         top_k_idxs = top_k_idxs.tolist()
         self.top_k_xs = [self.train_x[i] for i in top_k_idxs]
         self.top_k_zs = self.train_z[top_k_idxs]
+
+    def initialize_conditional_encoder(self):
+        if self.conditional_input_dim is None:
+            return None
+        return ConditionalEncoder(
+            input_dim=self.conditional_input_dim,
+            output_dim=self.train_z.shape[-1],
+            hidden_dim=self.conditional_hidden_dim,
+        ).cuda()
+
+    def initialize_pseudo_labeler(self):
+        if not self.use_pseudo_labels:
+            return None
+        return PseudoLabeler(
+            quantile=self.pseudo_label_quantile,
+            min_weight=self.pseudo_label_min_weight,
+            uncertainty_weight=self.pseudo_label_uncertainty_weight,
+        )
+
+    def initialize_covariates(self):
+        if self.train_covariates is None:
+            self.train_covariates = self.objective.get_covariates(self.train_x)
+        if self.train_covariates is None:
+            return self
+        if not torch.is_tensor(self.train_covariates):
+            self.train_covariates = torch.tensor(self.train_covariates).float()
+        for x, covariate in zip(self.train_x, self.train_covariates):
+            self.xs_to_covariates[x] = covariate.detach().cpu()
+        best_covariate = self.xs_to_covariates.get(self.best_x_seen)
+        if best_covariate is not None:
+            self.best_covariate = best_covariate
+        return self
 
     def initialize_tr_state(self):
         self.tr_state = TurboState(
@@ -106,6 +174,11 @@ class InvBOState:
         '''
         z_next_ = z_next_.detach().cpu() 
         y_next_ = y_next_.detach().cpu()
+        covariates_next = None
+        if self.train_covariates is not None:
+            covariates_next = self.objective.get_covariates(x_next_)
+            if covariates_next is not None and not torch.is_tensor(covariates_next):
+                covariates_next = torch.tensor(covariates_next).float()
         if len(y_next_.shape) > 1:
             y_next_ = y_next_.squeeze() 
         if len(z_next_.shape) == 1:
@@ -119,6 +192,11 @@ class InvBOState:
                 continue
                 
             self.train_x.append(x_next_[i])
+            if covariates_next is not None:
+                covariate = covariates_next[i].detach().cpu()
+                self.xs_to_covariates[x_next_[i]] = covariate
+                if torch.is_tensor(self.train_covariates):
+                    self.train_covariates = torch.cat((self.train_covariates, covariate.unsqueeze(0)), dim=0)
             if len(self.top_k_scores) < self.k: 
                 self.top_k_scores.append(score.item())
                 self.top_k_xs.append(x_next_[i])
@@ -137,6 +215,8 @@ class InvBOState:
                 progress = True
                 self.best_score_seen = score.item() #update best
                 self.best_x_seen = x_next_[i]
+                if covariates_next is not None:
+                    self.best_covariate = covariates_next[i].detach().cpu()
                 self.new_best_found = True
         if (not progress) and acquisition: # if no progress msde, increment progress fails
             self.progress_fails_since_last_e2e += 1
@@ -151,17 +231,106 @@ class InvBOState:
 
         return self
 
+    def _aligned_covariates(self, xs):
+        if not self.xs_to_covariates:
+            return None
+        covariates = []
+        for x in xs:
+            covariate = self.xs_to_covariates.get(x)
+            if covariate is None:
+                return None
+            covariates.append(covariate)
+        return torch.stack(covariates).float()
+
+    def _collect_pseudo_labels(self):
+        if self.pseudo_labeler is None:
+            return None
+        unlabeled_xs, unlabeled_covariates = self.objective.get_unlabeled_pool()
+        if not unlabeled_xs:
+            return None
+        pseudo_xs, pseudo_y, weights, pseudo_covariates = self.pseudo_labeler.select(
+            self.model,
+            self.objective,
+            unlabeled_xs,
+            covariates=unlabeled_covariates,
+        )
+        if not pseudo_xs:
+            return None
+        with torch.no_grad():
+            z, _, _, _ = self.objective.vae_forward(pseudo_xs)
+        return {
+            "xs": pseudo_xs,
+            "z": z.detach().cpu(),
+            "y": pseudo_y.float(),
+            "weights": weights.float(),
+            "covariates": pseudo_covariates,
+        }
+
+    def _adjust_trust_region(self):
+        if not self.conditional_trust_region or self.conditional_encoder is None:
+            return
+        top_covariates = self._aligned_covariates(self.top_k_xs)
+        if top_covariates is None:
+            return
+        target_covariate = self.best_covariate
+        if target_covariate is None:
+            target_covariate = top_covariates[0]
+        top_scores = torch.tensor(self.top_k_scores).float()
+        target_score = torch.tensor([self.best_score_seen]).float()
+        with torch.no_grad():
+            cond_embeddings = self.conditional_encoder(top_scores, top_covariates)
+            target_embedding = self.conditional_encoder(target_score, target_covariate.unsqueeze(0))
+            similarity = F.cosine_similarity(
+                cond_embeddings,
+                target_embedding.expand_as(cond_embeddings),
+                dim=-1,
+            )
+            similarity = (similarity + 1.0) / 2.0
+            similarity_score = similarity.mean()
+
+            posterior = self.model.posterior(self.top_k_zs.cuda())
+            mean = posterior.mean.squeeze(-1)
+            variance = posterior.variance.squeeze(-1)
+            potential = mean - self.conditional_potential_uncertainty * variance.sqrt()
+            if potential.numel() > 1:
+                potential_score = (potential - potential.min()) / (potential.max() - potential.min() + 1e-8)
+                potential_score = potential_score.mean()
+            else:
+                potential_score = torch.tensor(0.5, device=potential.device)
+
+            weight_sum = self.conditional_similarity_weight + self.conditional_potential_weight
+            if weight_sum > 0:
+                combined = (
+                    self.conditional_similarity_weight * similarity_score
+                    + self.conditional_potential_weight * potential_score
+                ) / weight_sum
+            else:
+                combined = torch.tensor(0.5, device=potential.device)
+            scale = 1 + self.conditional_tr_scale * (combined.item() - 0.5) * 2
+            new_length = self.tr_state.length * scale
+            self.tr_state.length = min(self.tr_state.length_max, max(self.tr_state.length_min, new_length))
+
     def update_surrogate_model(self): 
+        pseudo_payload = None
+        if self.initial_model_training_complete and self.pseudo_labeler is not None:
+            pseudo_payload = self._collect_pseudo_labels()
         if not self.initial_model_training_complete:
             n_epochs = self.init_n_epochs
             train_z = self.train_z
             train_y = self.train_y.squeeze(-1)
+            train_weights = None
         else:
             n_epochs = self.num_update_epochs
             new_zs = self.train_z[-self.bsz:]
             new_ys = self.train_y[-self.bsz:].squeeze(-1).tolist()
             train_z = torch.cat((new_zs, self.top_k_zs))
             train_y = torch.tensor(new_ys + self.top_k_scores).float()               
+            train_weights = None
+        if pseudo_payload is not None:
+            train_z = torch.cat((train_z, pseudo_payload["z"]), dim=0)
+            train_y = torch.cat((train_y, pseudo_payload["y"]), dim=0)
+            real_weights = torch.ones(len(train_y) - len(pseudo_payload["y"]))
+            train_weights = torch.cat((real_weights, pseudo_payload["weights"]), dim=0)
             
         self.model = update_surr_model(
             self.model,
@@ -170,6 +339,7 @@ class InvBOState:
             train_z,
             train_y,
             n_epochs,
+            train_weights=train_weights,
         )
         self.initial_model_training_complete = True
 
@@ -182,6 +352,20 @@ class InvBOState:
         new_ys = self.train_y[-self.bsz:].squeeze(-1).tolist()
         train_x = new_xs + self.top_k_xs
         train_y = torch.tensor(new_ys + self.top_k_scores).float()
+        train_covariates = self._aligned_covariates(train_x)
+        if self.pseudo_labeler is not None:
+            pseudo_payload = self._collect_pseudo_labels()
+            if pseudo_payload is not None:
+                train_x = train_x + pseudo_payload["xs"]
+                train_y = torch.cat((train_y, pseudo_payload["y"]), dim=0)
+                if train_covariates is not None and pseudo_payload["covariates"] is not None:
+                    if torch.is_tensor(pseudo_payload["covariates"]):
+                        pseudo_covariates = pseudo_payload["covariates"]
+                    else:
+                        pseudo_covariates = torch.tensor(pseudo_payload["covariates"]).float()
+                    train_covariates = torch.cat((train_covariates, pseudo_covariates), dim=0)
+                else:
+                    train_covariates = None
         self.objective, self.model = update_models_end_to_end(
             train_x,
             train_y,
@@ -196,6 +380,9 @@ class InvBOState:
             self.beta,
             self.gamma,
             self.delta,
+            conditional_encoder=self.conditional_encoder,
+            conditional_loss_weight=self.conditional_loss_weight,
+            covariates=train_covariates,
         )
         self.tot_num_e2e_updates += 1
 
@@ -205,6 +392,7 @@ class InvBOState:
         '''Generate new candidate points, 
         evaluate them, and update data
         '''
+        self._adjust_trust_region()
         z_next = generate_batch(
             state=self.tr_state,
             model=self.model,
