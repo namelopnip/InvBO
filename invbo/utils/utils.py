@@ -33,7 +33,10 @@ def update_models_end_to_end(
     alpha,
     beta,
     gamma,
-    delta
+    delta,
+    conditional_encoder=None,
+    conditional_loss_weight=0.0,
+    covariates=None,
 ):
     '''Finetune VAE end to end with surrogate model
     This method is build to be compatible with the 
@@ -41,9 +44,14 @@ def update_models_end_to_end(
     '''
     objective.vae.train()
     model.train() 
-    optimizer = torch.optim.Adam([
-            {'params': objective.vae.parameters()},
-            {'params': model.parameters()}], lr=learning_rte)
+    optimizer_params = [
+        {'params': objective.vae.parameters()},
+        {'params': model.parameters()},
+    ]
+    if conditional_encoder is not None:
+        conditional_encoder.train()
+        optimizer_params.append({'params': conditional_encoder.parameters()})
+    optimizer = torch.optim.Adam(optimizer_params, lr=learning_rte)
     max_string_length = len(max(train_x, key=len))
     bsz = max(1, int(2560/max_string_length)) 
     num_batches = math.ceil(len(train_x) / bsz)
@@ -77,7 +85,22 @@ def update_models_end_to_end(
             dim = z.shape[-1]
             c = math.exp(math.lgamma((dim+1)/2) - math.lgamma(dim/2))*2
 
-            loss = alpha * lip_loss + beta * surr_loss + gamma * vae_loss + delta * (dif_z - c).abs()
+            cond_loss = 0.0
+            if conditional_encoder is not None and conditional_loss_weight > 0:
+                if covariates is not None:
+                    batch_covariates = covariates[start_idx:stop_idx].cuda()
+                else:
+                    batch_covariates = None
+                cond_embedding = conditional_encoder(batch_y, batch_covariates)
+                cond_loss = torch.mean((z - cond_embedding) ** 2)
+
+            loss = (
+                alpha * lip_loss
+                + beta * surr_loss
+                + gamma * vae_loss
+                + delta * (dif_z - c).abs()
+                + conditional_loss_weight * cond_loss
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -98,6 +121,8 @@ def update_models_end_to_end(
 
     objective.vae.eval()
     model.eval()
+    if conditional_encoder is not None:
+        conditional_encoder.eval()
 
     return objective, model
 
@@ -107,18 +132,29 @@ def update_surr_model(
     learning_rte,
     train_z,
     train_y,
-    n_epochs
+    n_epochs,
+    train_weights=None,
 ):
     model = model.train()
     optimizer = torch.optim.Adam([{'params': model.parameters(), 'lr': learning_rte}], lr=learning_rte)
     train_bsz = min(len(train_y),128)
-    train_dataset = TensorDataset(train_z.cuda(), train_y.cuda())
+    if train_weights is None:
+        train_dataset = TensorDataset(train_z.cuda(), train_y.cuda())
+    else:
+        train_dataset = TensorDataset(train_z.cuda(), train_y.cuda(), train_weights.cuda())
     train_loader = DataLoader(train_dataset, batch_size=train_bsz, shuffle=True)
     for _ in range(n_epochs):
-        for (inputs, scores) in train_loader:
+        for batch in train_loader:
+            if train_weights is None:
+                inputs, scores = batch
+                weights = None
+            else:
+                inputs, scores, weights = batch
             optimizer.zero_grad()
             output = model(inputs.cuda())
             loss = -mll(output, scores.cuda())
+            if weights is not None:
+                loss = loss * weights.mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -147,3 +183,61 @@ class DataWeighter:
         else:
             weights = stats.norm.sf(y_star, loc=properties, scale=noise)
         return weights
+
+
+class ConditionalEncoder(torch.nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=32):
+        super().__init__()
+        self.network = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, y, covariates=None):
+        if y.dim() == 1:
+            y = y.unsqueeze(-1)
+        if covariates is not None:
+            cond = torch.cat([y, covariates], dim=-1)
+        else:
+            cond = y
+        return self.network(cond)
+
+
+class PseudoLabeler:
+    def __init__(self, quantile=0.8, min_weight=0.2, uncertainty_weight=0.1):
+        self.quantile = quantile
+        self.min_weight = min_weight
+        self.uncertainty_weight = uncertainty_weight
+
+    def select(self, model, objective, xs, covariates=None):
+        if not xs:
+            return [], torch.tensor([]), torch.tensor([]), None
+        objective.vae.eval()
+        model.eval()
+        with torch.no_grad():
+            z, _, _, _ = objective.vae_forward(xs)
+            posterior = model.posterior(z)
+            mean = posterior.mean.squeeze(-1)
+            variance = posterior.variance.squeeze(-1)
+            score = mean - self.uncertainty_weight * variance.sqrt()
+            threshold = torch.quantile(score, self.quantile) if score.numel() > 1 else score.min()
+            mask = score >= threshold
+            if not mask.any():
+                return [], torch.tensor([]), torch.tensor([]), None
+            pseudo_xs = [x for x, keep in zip(xs, mask.tolist()) if keep]
+            pseudo_y = mean[mask].detach().cpu()
+            uncertainty = variance[mask].sqrt()
+            max_uncertainty = variance.sqrt().max()
+            if torch.isfinite(max_uncertainty) and max_uncertainty > 0:
+                weights = 1.0 - uncertainty / max_uncertainty
+            else:
+                weights = torch.ones_like(uncertainty)
+            weights = weights.clamp(min=self.min_weight).detach().cpu()
+            if covariates is None:
+                pseudo_covariates = None
+            elif torch.is_tensor(covariates):
+                pseudo_covariates = covariates[mask.cpu()]
+            else:
+                pseudo_covariates = [c for c, keep in zip(covariates, mask.tolist()) if keep]
+            return pseudo_xs, pseudo_y, weights, pseudo_covariates
